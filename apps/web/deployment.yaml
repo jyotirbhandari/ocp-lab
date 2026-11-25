@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  labels:
+    app: web
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: web
+  template:
+    metadata:
+      labels:
+        app: web
+    spec:
+      containers:
+      - name: web
+        image: registry.access.redhat.com/ubi9/nginx-124
+        command: ["nginx", "-g", "daemon off;"]
+        ports:
+        - containerPort: 8080
+        volumeMounts:
+        - name: content
+          mountPath: /opt/app-root/src
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+      volumes:
+        - name: content
+          configMap:
+            name: web-content
