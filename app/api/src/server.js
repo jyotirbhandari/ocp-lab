@@ -47,3 +47,31 @@ app.get('/api/books/:id/reviews', h(async (req, res) => {
     .find({ bookId: Number(req.params.id) }).sort({ createdAt: -1 }).toArray();
   res.json(reviews);
 }));
+
+app.post('/api/books/:id/reviews', h(async (req, res) => {
+  const doc = {
+    bookId: Number(req.params.id),
+    rating: req.body.rating,
+    comment: req.body.comment,
+    createdAt: new Date(),
+  };
+  await mongo.db().collection('reviews').insertOne(doc);
+  res.status(201).json(doc);
+}));
+
+async function start() {
+  await mongo.connect();
+  const server = app.listen(8080, () => console.log('API listening on 8080'));
+
+  // graceful shutdown: Kubernetes sends SIGTERM before killing the pod
+  process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down');
+    server.close(async () => {
+      await pg.end();
+      await mongo.close();
+      process.exit(0);
+    });
+  });
+}
+
+start().catch((e) => { console.error(e); process.exit(1); });
