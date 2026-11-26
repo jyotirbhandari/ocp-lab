@@ -1,0 +1,60 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migrate
+  labels:
+    app: db-migrate
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app: db-migrate
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: ghcr.io/jyotirbhandari/bookstore-api:sha-4b616d7
+        command: ["node", "src/migrate.js"]
+        env:
+        # Postgres
+        - name: PGHOST
+          value: postgres
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_USER
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_PASSWORD
+        - name: PGDATABASE
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_DATABASE
+        # Mongo
+        - name: MONGO_HOST
+          value: mongo
+        - name: MONGO_USER
+          valueFrom:
+            secretKeyRef:
+              name: mongo-credentials
+              key: MONGO_INITDB_ROOT_USERNAME
+        - name: MONGO_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: mongo-credentials
+              key: MONGO_INITDB_ROOT_PASSWORD
+        - name: MONGO_DB
+          value: bookstore
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
