@@ -1,4 +1,4 @@
-# ocp-lab: learning Kubernetes and OpenShift by building a real app
+# k8s-bookstore-lab: learning Kubernetes and OpenShift by building a real app
 
 A hands-on learning repo. It deploys a small **Bookstore** app (nginx + Node.js API + PostgreSQL + MongoDB) to a **Red Hat OpenShift Developer Sandbox**, using **standard Kubernetes YAML** so the same app can later run on a local cluster (kind/Colima) with Istio, Cilium, Argo CD and Vault.
 
@@ -74,7 +74,7 @@ NetworkPolicies      → default deny; only nginx→api, api/migrate/backup→po
 ## 3. Repository layout
 
 ```
-ocp-lab/
+k8s-bookstore-lab/
 ├── .github/workflows/
 │   └── build-api.yml            CI: build + push the API image on changes to app/api/**
 ├── app/api/                     SOURCE CODE (what we build)
@@ -155,8 +155,8 @@ kubectl get storageclass
 > **Always dry-run first:** `kubectl apply -k <folder> --dry-run=server`
 
 ```bash
-git clone https://github.com/jyotirbhandari/ocp-lab.git
-cd ocp-lab
+git clone https://github.com/jyotirbhandari/k8s-bookstore-lab.git
+cd k8s-bookstore-lab
 ```
 
 ### Step 1: Secrets (credentials for the databases)
@@ -238,7 +238,7 @@ In the **sandbox**, you must also remove `allow-same-namespace`, or nothing is r
 
 The sandbox scales workloads to 0 after ~12h. Data (PVCs) is safe. Re-applying your files restores the replica counts, **in order**:
 ```bash
-cd ocp-lab
+cd k8s-bookstore-lab
 kubectl get deploy,sts,pods,pvc                           # what's there?
 kubectl get secret postgres-credentials mongo-credentials # should still exist
 
@@ -349,15 +349,15 @@ t api   mongo 27017       # expected: OPEN
 
 **Remove the sandbox's `allow-same-namespace`** (only after our policies are applied):
 ```bash
-mkdir -p ~/ocp-lab-backups
-kubectl get networkpolicy allow-same-namespace -o yaml > ~/ocp-lab-backups/allow-same-namespace.backup.yaml
+mkdir -p ~/k8s-bookstore-lab-backups
+kubectl get networkpolicy allow-same-namespace -o yaml > ~/k8s-bookstore-lab-backups/allow-same-namespace.backup.yaml
 kubectl delete networkpolicy allow-same-namespace
 # re-run the tests above + refresh the website
 ```
 
 **Restore it** (undo):
 ```bash
-kubectl apply -f ~/ocp-lab-backups/allow-same-namespace.backup.yaml
+kubectl apply -f ~/k8s-bookstore-lab-backups/allow-same-namespace.backup.yaml
 ```
 > Keep the backup **outside** the repo (or add `*.backup.yaml` to `.gitignore`). It's sandbox-specific.
 
@@ -387,20 +387,24 @@ kubectl rollout undo deployment/api --to-revision=<n>   # always name a revision
 ## 10. CI/CD: building the API image
 
 `.github/workflows/build-api.yml` runs on every push to `main` that changes `app/api/**` (or via **Run workflow** in the Actions tab):
-1. Checkout → Buildx → log in to GHCR with the built-in `GITHUB_TOKEN` (`permissions: packages: write`; no secrets to manage)
+1. Checkout → **QEMU** → Buildx → log in to GHCR with the built-in `GITHUB_TOKEN` (`permissions: packages: write`; no secrets to manage)
 2. Tags: `sha-<short-commit>` (immutable, used in the YAML) + `latest`
-3. Builds `linux/amd64` (sandbox nodes)
+3. **Multi-arch:** `linux/amd64` (sandbox / x86 nodes) + `linux/arm64` (kind on Apple Silicon). One tag points to a **manifest list**, and each cluster pulls the build that matches its nodes, so the YAML is the same everywhere.
+
+**Build time:** about 37s for amd64 only → about 1m42s with arm64. The arm64 half is **emulated by QEMU** on GitHub's x86 runner. That's fine here (pure-JavaScript dependencies). Apps with native modules (bcrypt, sharp…) can take far longer under emulation; teams then build each architecture on native runners (e.g. `ubuntu-24.04-arm`) and merge the manifests.
 
 Check an image without pulling it:
 ```bash
 oc image info ghcr.io/jyotirbhandari/bookstore-api:sha-<commit> --filter-by-os=linux/amd64
 ```
-- `unknown/unknown` in the manifest list = a **build provenance attestation**, not an image.
+- Without `--filter-by-os` you see the manifest list: `linux/amd64`, `linux/arm64`, and `unknown/unknown`.
+- `unknown/unknown` = a **build provenance attestation** (one per architecture), not an image.
+- Check that a base image supports your architectures **before** adding them to `platforms` (e.g. `oc image info registry.access.redhat.com/ubi9/nodejs-24` lists `linux/arm64/v8`).
 - The package is public because it's linked to the public repo (inherited access).
 
 **Deploying a new version:** update the `image:` tag in `deploy/api/deployment.yaml` (and `deploy/migrate/job.yaml`) → `kubectl apply -k`. (Argo CD will automate this later.)
 
-> 🔜 Planned: add `linux/arm64` (multi-arch) for local clusters on Apple Silicon.
+> ℹ️ First multi-arch image: `sha-b41a021`. The sandbox YAML still uses `sha-4b616d7` (amd64-only), which works there because sandbox nodes are amd64.
 
 ---
 
@@ -480,7 +484,7 @@ Real problems we hit while building this, and how we found them.
 - [x] NetworkPolicies (incl. removing the sandbox's `allow-same-namespace`)
 
 **Before going local**
-- [ ] Multi-arch image (`linux/amd64` + `linux/arm64`)
+- [x] Multi-arch image (`linux/amd64` + `linux/arm64`), first tag `sha-b41a021`
 - [ ] Kustomize `base/` + `overlays/{openshift,local}`
 - [ ] Secrets out of `kustomization.yaml`
 
