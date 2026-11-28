@@ -1,0 +1,60 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pg-restore
+  labels:
+    app: pg-restore
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 600
+  template:
+    metadata:
+      labels:
+        app: pg-restore
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: psql
+        image: quay.io/sclorg/postgresql-16-c9s
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          set -e
+          echo "restoring $BACKUP_FILE"
+          psql -v ON_ERROR_STOP=1 -f "/backups/$BACKUP_FILE"
+          echo "restore complete"
+        env:
+        - name: BACKUP_FILE
+          value: bookstore-20261128-001239.sql
+        - name: PGHOST
+          value: postgres
+        - name: PGUSER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_USER
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_PASSWORD
+        - name: PGDATABASE
+          valueFrom:
+            secretKeyRef:
+              name: postgres-credentials
+              key: POSTGRESQL_DATABASE
+        volumeMounts:
+        - name: backups
+          mountPath: /backups
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+      volumes:
+      - name: backups
+        persistentVolumeClaim:
+          claimName: pg-backups
