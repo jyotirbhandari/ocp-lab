@@ -24,6 +24,7 @@ A hands-on learning repo. It deploys a small **Bookstore** app (nginx + Node.js 
 13. [kubectl vs oc](#13-kubectl-vs-oc)
 14. [Roadmap](#14-roadmap)
 15. [Teardown](#15-teardown)
+16. [Local cluster: Colima + kind + Calico](#16-local-cluster-colima--kind--calico)
 
 ---
 
@@ -85,6 +86,11 @@ k8s-bookstore-lab/
 │   │   ├── server.js            HTTP API: /api/healthz, /api/readyz, /api/info, /api/books, /api/books/:id/reviews
 │   │   └── migrate.js           One-shot migration runner (schema_migrations table, exit 0/1)
 │   └── migrations/              001_create_books.sql, 002_seed_books.sql
+├── platform/                    CLUSTER SETUP (local only; OpenShift provides its own)
+│   ├── kind/cluster.yaml        2 nodes, default CNI off, podSubnet 10.244.0.0/16, ports 80/443
+│   ├── calico/values.yaml       Tigera operator values: IP pool = podSubnet, VXLANCrossSubnet
+│   ├── metrics-server/values.yaml   --kubelet-insecure-tls (kind's self-signed kubelet certs; lab only)
+│   └── traefik/values.yaml      ingress controller: control-plane node, hostPort 80/443, Service ClusterIP
 └── deploy/                      KUBERNETES YAML (how it runs)
     ├── base/                    THE SAME ON EVERY CLUSTER ("main recipe"). Never applied directly.
     │   ├── kustomization.yaml   lists: postgres, mongo, api, nginx, backup, policies (NOT migrate)
@@ -97,8 +103,10 @@ k8s-bookstore-lab/
     │   └── policies/            default-deny-ingress.yaml, allow-*.yaml
     └── overlays/                WHAT'S DIFFERENT PER CLUSTER ("sticky note"). This is what you apply.
         ├── openshift/           + ingress.yaml (sandbox host, openshift-default class, route edge annotation)
-        └── local/               + namespace.yaml (bookstore), ingress.yaml (ingress-nginx, bookstore.localhost),
-                                   images: multi-arch API tag, patches: nginx 1 replica, HPA min 1
+        └── local/               + namespace.yaml (bookstore), ingress.yaml (Traefik, bookstore.localhost),
+            │                      allow-ingress-to-nginx.yaml (Traefik ns → nginx:8080),
+            │                      images: multi-arch API tag, patches: nginx 1 replica, HPA min 1
+            └── migrate/         the migration Job for kind: base/migrate + namespace + multi-arch tag
 ```
 
 **Rules used in this repo**
@@ -193,8 +201,23 @@ cp deploy/base/postgres/secret.example.yaml deploy/base/postgres/secret.yaml
 cp deploy/base/mongo/secret.example.yaml    deploy/base/mongo/secret.yaml
 # edit both files: replace CHANGE_ME with real passwords
 git status        # secret.yaml must NOT appear (it's gitignored)
+
+# Apply the secrets SEPARATELY: they are not part of any kustomization
+kubectl apply -f deploy/base/postgres/secret.yaml
+kubectl apply -f deploy/base/mongo/secret.yaml
+# (local kind cluster: add  -n bookstore  after creating the namespace)
 ```
-> ℹ️ The postgres/mongo `kustomization.yaml` currently list `secret.yaml`, so `-k` applies them automatically and **fails if the file is missing**. This will change before Argo CD (Git won't contain the secret).
+> ℹ️ **Why aren't the secrets in the kustomizations?** `secret.yaml` exists only on your machine (gitignored). If a kustomization listed it, anyone who clones the repo, **including Argo CD**, would fail with `secret.yaml: no such file or directory`, and the whole overlay would fail to build. So Git describes the app without secrets, and secrets are delivered separately: by hand now, by **Vault + External Secrets** later.
+>
+> **When do you need to apply them?** Only when they don't exist yet in a cluster: a new cluster, or after a teardown. They survive sandbox idling and `kubectl apply` (apply never deletes objects that disappear from your files; that's called *pruning*).
+>
+> **Test that the repo builds without local files** (simulates Argo CD; commit first, because clone copies committed files only):
+> ```bash
+> cd /tmp && rm -rf clone-test && git clone -q ~/tools/repos/k8s-bookstore-lab clone-test
+> kubectl kustomize clone-test/deploy/overlays/openshift > /dev/null && echo "BUILD OK"
+> kubectl kustomize clone-test/deploy/overlays/local     > /dev/null && echo "BUILD OK"
+> rm -rf /tmp/clone-test
+> ```
 
 ### Step 2: PostgreSQL (StatefulSet + PVC + headless Service)
 **Concept:** a **StatefulSet** gives the database a stable name (`postgres-0`) and **its own disk** (PVC `data-postgres-0`) that survives pod restarts. A **headless Service** (`clusterIP: None`) gives it a DNS name: `postgres`.
@@ -458,7 +481,16 @@ Real problems we hit while building this, and how we found them.
 | API dropped to 1 pod briefly when adding the HPA | Removing `replicas:` from the YAML → apply deleted the field → default 1 → HPA scaled back to 2 | `kubectl get pods` | Expected; in production use `kubectl apply edit-last-applied` first |
 | NetworkPolicy has no effect | The sandbox's `allow-same-namespace` (policies add up) | `kubectl get networkpolicy` | Remove it ([§9.4](#94-network-policies)) |
 | Port-forward always hits the same pod | `port-forward svc/x` picks one pod | `/api/info` | Test load balancing via the public URL |
+| Fresh clone: `accumulating resources … secret.yaml: no such file or directory` | A kustomization listed a gitignored file | Clone the repo to `/tmp` and run `kubectl kustomize` | Remove secrets from kustomizations; apply them separately |
+| Clone test still fails after fixing | The fix wasn't **committed**; `git clone` copies committed files only | `git status` shows ` M …kustomization.yaml` | Commit, then re-test |
 | Pod `Completed` + restarts with empty logs | `server.js` was missing `app.listen()` (file truncated) | Code review before the build | Keep files complete; `node --check` |
+| `helm install` Calico: `no matches for kind "Installation" … ensure CRDs are installed first` | Since Calico v3.32 the CRDs are **not** in the `tigera-operator` chart | `helm show crds … \| grep -c CustomResourceDefinition` → 0; chart README | Apply the `crd.projectcalico.org.v1` chart first (`helm template … \| kubectl apply --server-side -f -`) |
+| Traefik chart: `at '/service': additional properties 'type' not allowed` | Chart 43 moved the Service type to `service.spec.type`; its values **schema** rejects unknown keys | `helm install … --dry-run=server`; `helm show values … \| grep -n -B6 'type: LoadBalancer'` | `service: { spec: { type: ClusterIP } }` |
+| `zsh: no such file or directory: VERSION` | A `<VERSION>` placeholder was pasted; zsh reads `<` as input redirection | Error text | Put the real chart version |
+| `bookstore.localhost` **hangs**, then `504 Gateway Timeout` from Traefik | `default-deny-ingress` blocks Traefik → nginx (Calico silently drops). On the sandbox, OpenShift's own `allow-from-openshift-ingress` hid this | `curl -v -m 40` → `Connected` + 504 after ~30s; port-forward works (bypasses policies) | `allow-ingress-to-nginx` in the overlay (from the ingress controller's namespace) |
+| Fresh cluster: API `CrashLoopBackOff`, then fine after ~2 min | `server.js` exits if Mongo isn't reachable within 3s at start-up; all pods start together on a new cluster | `kubectl logs deploy/api --previous` | Self-heals once Mongo is up. Better: retry in the app, or an initContainer |
+| Migration Job on kind: `exec format error` (expected if not fixed) | `base/migrate` has the amd64-only tag; `migrate/` isn't in the overlay, so `images:` doesn't reach it | `kubectl kustomize deploy/overlays/local \| grep image:` (Job missing) | `deploy/overlays/local/migrate/` with its own `images:` |
+| kind nodes `NotReady`, CoreDNS `Pending` | No CNI yet (`disableDefaultCNI: true`) | `kubectl describe node` → `cni plugin not initialized` | Expected until Calico is running |
 | `docker.io` pull fails with `toomanyrequests` | Docker Hub anonymous rate limit | Events | Use `mirror.gcr.io/library/<image>` |
 
 **General debugging order:** `get` → `describe` (Events!) → `logs` / `logs --previous` → `get events --sort-by=.lastTimestamp` → `exec` into the pod.
@@ -518,10 +550,15 @@ Real problems we hit while building this, and how we found them.
 **Before going local**
 - [x] Multi-arch image (`linux/amd64` + `linux/arm64`), first tag `sha-b41a021`
 - [x] Kustomize `base/` + `overlays/{openshift,local}` (verified with `kubectl diff`: exit 0)
-- [ ] Secrets out of `kustomization.yaml`
+- [x] Secrets out of `kustomization.yaml` (fresh-clone build test: BUILD OK for both overlays)
 
 **Local cluster (Colima + kind)**
 - [ ] Stage 1: kind (multi-node) + **Calico** + metrics-server + ingress + Bookstore
+  - [x] kind cluster `bookstore` (2 nodes, Kubernetes v1.37) on Colima
+  - [x] Calico v3.33.1 (Tigera operator); nodes Ready
+  - [x] metrics-server 3.14.0 (`kubectl top` works)
+  - [x] Traefik 43.0.0 (ingress controller; ingress-nginx is retired)
+  - [x] Bookstore via `deploy/overlays/local` → http://bookstore.localhost (books from local Postgres)
 - [ ] Stage 2: **Istio sidecar mode**: mTLS, AuthorizationPolicy, Prometheus, Grafana, Kiali, tracing, canary, fault injection
 - [ ] Stage 3: **Istio ambient mode** (sidecar → ztunnel migration)
 - [ ] Stage 4: **Cilium** (eBPF) + Hubble; compare with Istio
@@ -534,9 +571,127 @@ Real problems we hit while building this, and how we found them.
 ```bash
 kubectl delete -k deploy/base/migrate/ --ignore-not-found   # the Job isn't part of the overlay
 kubectl delete -k deploy/overlays/openshift                 # everything else (incl. the Ingress)
+kubectl delete secret postgres-credentials mongo-credentials  # secrets are not part of the overlay
 
 # StatefulSet PVCs are NOT deleted automatically (on purpose: data safety).
 kubectl get pvc
 kubectl delete pvc data-postgres-0 data-mongo-0       # ⚠️ permanently deletes the data (ReclaimPolicy: Delete)
 ```
 To restore the sandbox's default network behaviour, re-apply `allow-same-namespace` ([§9.4](#94-network-policies)).
+
+---
+
+## 16. Local cluster: Colima + kind + Calico
+
+**Layers:** Mac → **Colima** VM (Linux, Docker engine) → **kind** "nodes" (Docker containers running kubeadm-built Kubernetes, containerd inside) → your pods.
+
+| Tool | Role |
+|---|---|
+| Colima | The Linux machine (6 CPU / 8 GiB used here; k3s **off**) |
+| kind | Builds a multi-node, upstream Kubernetes cluster from `platform/kind/cluster.yaml` |
+| Calico | The CNI: pod IPs, routing (VXLAN), NetworkPolicy enforcement |
+
+### 16.1 Create the cluster
+```bash
+colima list                                     # Running, docker runtime
+kind create cluster --config platform/kind/cluster.yaml
+kubectl config current-context                  # kind-bookstore  ⚠️ check before every apply
+kubectl get nodes                               # NotReady: expected, no CNI yet
+```
+- `disableDefaultCNI: true` turns off kindnet so Calico can be the CNI.
+- `podSubnet` must match Calico's IP pool `cidr`.
+- `extraPortMappings` 80/443 + label `ingress-ready=true` let `http://bookstore.localhost` reach the ingress controller.
+- Switch clusters with `kubectl config use-context <name>`; `kubectl config get-contexts` lists them.
+
+### 16.2 Install Calico (CRDs first, then the operator)
+```bash
+helm repo add projectcalico https://docs.tigera.io/calico/charts && helm repo update
+
+# 1. CRDs (separate chart since v3.32; server-side apply because some CRDs are very large)
+helm template calico-crds projectcalico/crd.projectcalico.org.v1 --version v3.33.1 \
+  | kubectl apply --server-side -f -
+
+# 2. Operator + Installation (built from platform/calico/values.yaml)
+helm install calico projectcalico/tigera-operator --version v3.33.1 \
+  --namespace tigera-operator --create-namespace -f platform/calico/values.yaml
+
+kubectl get pods -n calico-system -w            # calico-node (1 per node) → Running
+kubectl get nodes                               # Ready
+kubectl get tigerastatus                        # AVAILABLE True
+kubectl get installation default -o jsonpath='{.spec.calicoNetwork.ipPools[*].cidr}{"\n"}'   # 10.244.0.0/16
+```
+
+### 16.3 metrics-server and Traefik
+```bash
+# metrics-server: needed by kubectl top and the HPA (OpenShift ships it; kind doesn't)
+helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/
+helm install metrics-server metrics-server/metrics-server --version 3.14.0 \
+  --namespace kube-system -f platform/metrics-server/values.yaml
+kubectl top nodes            # ⚠️ on kind each node reports the WHOLE VM as capacity, so % is misleading
+
+# Traefik: the ingress controller (local equivalent of the OpenShift router)
+helm repo add traefik https://traefik.github.io/charts
+helm install traefik traefik/traefik --version 43.0.0 --namespace traefik --create-namespace \
+  -f platform/traefik/values.yaml --dry-run=server     # validate against the chart's schema first
+helm install traefik traefik/traefik --version 43.0.0 --namespace traefik --create-namespace \
+  -f platform/traefik/values.yaml
+kubectl get ingressclass                               # traefik → use in ingressClassName
+curl -s -o /dev/null -w '%{http_code}\n' http://localhost/   # 404 = Traefik reached, no rule yet
+```
+Why ingress-nginx isn't used: the Kubernetes project retired it (maintenance ended March 2026). Its successor direction is **Gateway API** (Stage 2+ with Istio).
+
+| Exposure | Defined on | Opens | Used here |
+|---|---|---|---|
+| ClusterIP | Service | nothing (in-cluster only) | all app Services, Traefik's Service |
+| hostPort | Pod | the pod's own node | Traefik 80/443 on the control plane (mapped to the Mac by kind) |
+| NodePort | Service | 30000–32767 on every node | — |
+| LoadBalancer | Service | a cloud LB (stays `<pending>` on kind) | — (likely what fronts the OpenShift router on ROSA) |
+
+**Scheduling:** `nodeSelector` = *must* run on matching nodes; `toleration` = *allowed* on a tainted node. Traefik needs both to land on the control plane.
+**DaemonSet vs Deployment:** a DaemonSet runs 1 pod **per node** (calico-node, kube-proxy); a Deployment runs N replicas anywhere (metrics-server, Traefik, CoreDNS, operators).
+
+### 16.4 Deploy the Bookstore
+```bash
+kubectl config current-context                                   # kind-bookstore
+kubectl config set-context --current --namespace=bookstore       # default namespace (like oc project)
+
+# 1. Namespace + secrets (not in Git, applied by hand; Vault + ESO later)
+kubectl apply -f deploy/overlays/local/namespace.yaml
+kubectl apply -f deploy/base/postgres/secret.yaml -n bookstore
+kubectl apply -f deploy/base/mongo/secret.yaml    -n bookstore
+
+# 2. The app (everything except the migration Job)
+kubectl apply -k deploy/overlays/local --dry-run=server
+kubectl apply -k deploy/overlays/local
+kubectl get pods -w              # API may restart a few times until Mongo is up (see §11)
+
+# 3. Migration Job (after the DBs are Ready). Its own entry point: timing + Jobs are immutable
+kubectl apply -k deploy/overlays/local/migrate
+kubectl logs job/db-migrate
+
+# 4. Test
+curl -s http://bookstore.localhost/api/books                     # *.localhost → 127.0.0.1, no hosts file needed
+```
+Open **http://bookstore.localhost**.
+
+**Why the ingress policy lives in the overlay:** *which* ingress controller lets traffic in is cluster-specific (Traefik here, the OpenShift router on OpenShift, the Istio gateway in Stage 2), so the policy sits next to the Ingress it serves. The base keeps `default-deny-ingress` + the app-internal allows.
+
+### 16.5 Concepts met here
+- **CRD** = a new object type the API server accepts (like loading an LDAP **schema**). A **CR** is one object of that type (like an LDAP **entry**). On its own it's just data.
+- **Operator** = a pod with RBAC that **watches** CRs and **reconciles** (makes reality match the spec), level-triggered. The tigera-operator reads `Installation "default"` (Helm rendered it from `values.yaml`) and builds `calico-system`. If the operator dies, Calico keeps running; only repairs and upgrades stop.
+- **The pod start-up relay:** helm → API server → Deployment controller → ReplicaSet controller → scheduler → kubelet → **CRI** → containerd → runc. Control-plane components are **static pods** from `/etc/kubernetes/manifests` on the control-plane node.
+- **Plugs:** CRI (containers: containerd on kind, **CRI-O** on OpenShift), CNI (network: Calico here, OVN-Kubernetes on OpenShift), CSI (storage).
+
+| Calico pod | Job |
+|---|---|
+| tigera-operator | Builds and maintains everything below |
+| calico-node (DaemonSet) | Per-node networking + policy enforcement (Felix) |
+| calico-typha | Cache between the API server and calico-node |
+| calico-kube-controllers | Housekeeping (IPAM cleanup, sync) |
+| calico-apiserver | Serves the `projectcalico.org/v3` API |
+| goldmane / whisker | Flow-log aggregator / flow-log web UI |
+
+### 16.6 Delete / rebuild
+```bash
+kind delete cluster --name bookstore            # everything gone in seconds; recreate with 16.1–16.2
+```

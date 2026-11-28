@@ -5,6 +5,7 @@ resources:
 - namespace.yaml
 - ../../base
 - ingress.yaml
+- allow-ingress-to-nginx.yaml
 images:
 - name: ghcr.io/jyotirbhandari/bookstore-api
   newTag: sha-b41a021

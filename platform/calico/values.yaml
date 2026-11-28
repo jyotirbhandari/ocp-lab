@@ -1,0 +1,11 @@
+installation:
+  enabled: true
+  cni:
+    type: Calico
+  calicoNetwork:
+    ipPools:
+    - name: default-ipv4-ippool
+      cidr: 10.244.0.0/16          # MUST match podSubnet in platform/kind/cluster.yaml
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
