@@ -85,23 +85,46 @@ k8s-bookstore-lab/
 │   │   ├── server.js            HTTP API: /api/healthz, /api/readyz, /api/info, /api/books, /api/books/:id/reviews
 │   │   └── migrate.js           One-shot migration runner (schema_migrations table, exit 0/1)
 │   └── migrations/              001_create_books.sql, 002_seed_books.sql
-└── deploy/                      KUBERNETES YAML (how it runs); one folder per component
-    ├── postgres/                secret(.example).yaml, service.yaml (headless), statefulset.yaml
-    ├── mongo/                   secret(.example).yaml, service.yaml (headless), statefulset.yaml
-    ├── migrate/                 job.yaml
-    ├── api/                     deployment.yaml, service.yaml, hpa.yaml
-    ├── nginx/                   configmap-content.yaml, configmap-proxy.yaml, deployment.yaml, service.yaml, ingress.yaml
-    ├── backup/                  pvc.yaml, cronjob.yaml, restore-job.yaml (manual, NOT in kustomization)
-    └── policies/                default-deny-ingress.yaml, allow-*.yaml
+└── deploy/                      KUBERNETES YAML (how it runs)
+    ├── base/                    THE SAME ON EVERY CLUSTER ("main recipe"). Never applied directly.
+    │   ├── kustomization.yaml   lists: postgres, mongo, api, nginx, backup, policies (NOT migrate)
+    │   ├── postgres/            secret(.example).yaml, service.yaml (headless), statefulset.yaml
+    │   ├── mongo/               secret(.example).yaml, service.yaml (headless), statefulset.yaml
+    │   ├── migrate/             job.yaml (run separately, at the right moment)
+    │   ├── api/                 deployment.yaml, service.yaml, hpa.yaml
+    │   ├── nginx/               configmap-content.yaml, configmap-proxy.yaml, deployment.yaml, service.yaml
+    │   ├── backup/              pvc.yaml, cronjob.yaml, restore-job.yaml (manual, NOT in kustomization)
+    │   └── policies/            default-deny-ingress.yaml, allow-*.yaml
+    └── overlays/                WHAT'S DIFFERENT PER CLUSTER ("sticky note"). This is what you apply.
+        ├── openshift/           + ingress.yaml (sandbox host, openshift-default class, route edge annotation)
+        └── local/               + namespace.yaml (bookstore), ingress.yaml (ingress-nginx, bookstore.localhost),
+                                   images: multi-arch API tag, patches: nginx 1 replica, HPA min 1
 ```
 
 **Rules used in this repo**
 - `app/` = code. `deploy/` = YAML. Never mix them.
-- **Every `deploy/<component>/` folder has a `kustomization.yaml`** listing exactly which files to apply. Apply with **`-k`** (not `-f`).
+- **Every folder has a `kustomization.yaml`** listing exactly which files or folders to include. Apply with **`-k`** (not `-f`).
+- **Apply an overlay, never the base:** `kubectl apply -k deploy/overlays/<cluster>`. The base has no entry point (Ingress), so applying it on the sandbox would remove the public URL.
 - **Real secrets are never committed.** `secret.yaml` is in `.gitignore`; only `secret.example.yaml` (placeholders) is in Git.
-- **Standard Kubernetes first.** OpenShift-only pieces are kept to a minimum (for example, one annotation on the Ingress) so the same YAML runs on kind/minikube/k3s.
+- **Standard Kubernetes first.** Cluster-specific bits live only in overlays, so the base runs on OpenShift, kind, minikube and k3s.
+- **Platform vs. app:** cluster setup (CNI such as Calico/Cilium, Istio control plane, ingress controller, Argo CD) will live in `platform/`. App differences per cluster live in `deploy/overlays/`.
 
-> 🔜 **Planned change:** this will become `deploy/base/` + `deploy/overlays/{openshift,local}/` (Kustomize overlays) before moving to a local cluster. This section will be updated then.
+### Kustomize base + overlays, in plain words
+One **main recipe** (`base/`) and one small **sticky note per kitchen** (`overlays/<cluster>/`) listing only what's different there. Kustomize combines them: `final YAML = base + overlay`.
+
+| Kustomize feature | Plain meaning | Used in |
+|---|---|---|
+| `resources:` | Include these files/folders (folders = nested kustomizations) | everywhere |
+| `namespace:` | Put every object into this namespace | `local` → `bookstore` |
+| `images:` | Change an image tag everywhere it appears, in one place | `local` → multi-arch `sha-b41a021` |
+| `patches:` | Change specific fields of an object (strategic merge or JSON patch `op/path/value`) | `local` → nginx `replicas: 1`, HPA `minReplicas: 1` |
+
+Preview without applying, and compare with the cluster:
+```bash
+kubectl kustomize deploy/overlays/local | less                 # render the final YAML
+kubectl diff -k deploy/overlays/openshift; echo "exit: $?"     # 0 = cluster already matches
+```
+**Refactoring safely:** when we restructured `deploy/` into base + overlays, `kubectl diff -k deploy/overlays/openshift` returned **exit 0**: the structure changed, but what runs didn't.
 
 ---
 
@@ -150,7 +173,11 @@ kubectl get storageclass
 
 ## 6. Deploy from scratch (step by step)
 
-> **Order matters:** secrets → databases → migrations → API → nginx/ingress → backup → network policies.
+> **Two ways to deploy:**
+> - **Learning (this section):** apply one component at a time from `deploy/base/<component>`, so you see each piece work before the next.
+> - **Everyday:** `kubectl apply -k deploy/overlays/openshift` deploys everything at once (then run the migration Job). See [§7](#7-daily-start-up-after-the-sandbox-idles).
+>
+> **Order matters:** secrets → databases → migrations → API → nginx → ingress → backup → network policies.
 > Every `kubectl` command below also works with `oc`.
 > **Always dry-run first:** `kubectl apply -k <folder> --dry-run=server`
 
@@ -162,8 +189,8 @@ cd k8s-bookstore-lab
 ### Step 1: Secrets (credentials for the databases)
 **Concept:** a Secret keeps passwords out of the YAML that's in Git. Pods read them as environment variables. (Base64 is **not** encryption; Vault comes later.)
 ```bash
-cp deploy/postgres/secret.example.yaml deploy/postgres/secret.yaml
-cp deploy/mongo/secret.example.yaml    deploy/mongo/secret.yaml
+cp deploy/base/postgres/secret.example.yaml deploy/base/postgres/secret.yaml
+cp deploy/base/mongo/secret.example.yaml    deploy/base/mongo/secret.yaml
 # edit both files: replace CHANGE_ME with real passwords
 git status        # secret.yaml must NOT appear (it's gitignored)
 ```
@@ -172,15 +199,15 @@ git status        # secret.yaml must NOT appear (it's gitignored)
 ### Step 2: PostgreSQL (StatefulSet + PVC + headless Service)
 **Concept:** a **StatefulSet** gives the database a stable name (`postgres-0`) and **its own disk** (PVC `data-postgres-0`) that survives pod restarts. A **headless Service** (`clusterIP: None`) gives it a DNS name: `postgres`.
 ```bash
-kubectl apply -k deploy/postgres/ --dry-run=server
-kubectl apply -k deploy/postgres/
+kubectl apply -k deploy/base/postgres/ --dry-run=server
+kubectl apply -k deploy/base/postgres/
 kubectl get pvc,pods -l app=postgres -w     # PVC Pending → Bound once the pod starts (WaitForFirstConsumer)
 ```
 
 ### Step 3: MongoDB
 Same pattern as Postgres; different image, port (27017) and data path (`/data/db`).
 ```bash
-kubectl apply -k deploy/mongo/
+kubectl apply -k deploy/base/mongo/
 kubectl get pods -l app=mongo -w            # wait for 1/1
 kubectl exec mongo-0 -- id                  # random UID assigned by OpenShift
 ```
@@ -188,7 +215,7 @@ kubectl exec mongo-0 -- id                  # random UID assigned by OpenShift
 ### Step 4: Migration Job (schema + seed data)
 **Concept:** a **Job** runs to completion. It uses the **same API image** with a different command (`node src/migrate.js`). Exit code 0 = success, 1 = retry (up to `backoffLimit`). A `schema_migrations` table makes it **safe to re-run**.
 ```bash
-kubectl apply -k deploy/migrate/
+kubectl apply -k deploy/base/migrate/
 kubectl get pods -l app=db-migrate -w       # Completed
 kubectl logs job/db-migrate                 # apply 001…, apply 002…, mongo indexes ensured
 kubectl exec postgres-0 -- psql -d bookstore -c 'SELECT * FROM books;'
@@ -200,7 +227,7 @@ kubectl exec postgres-0 -- psql -d bookstore -c 'SELECT * FROM books;'
 - **livenessProbe** `/api/healthz`: failing → the container is restarted.
 - **HPA** scales 2–5 pods at 60% of the CPU request. The Deployment has **no `replicas:` field**, because the HPA owns it.
 ```bash
-kubectl apply -k deploy/api/
+kubectl apply -k deploy/base/api/
 kubectl get pods -l app=api -w              # 0/1 → 1/1 once readyz passes
 kubectl get hpa api                         # cpu: 4%/60%, REPLICAS 2
 ```
@@ -208,9 +235,12 @@ kubectl get hpa api                         # cpu: 4%/60%, REPLICAS 2
 ### Step 6: nginx + Ingress (public URL)
 **Concept:** nginx serves `index.html` and forwards `/api/` to the `api` Service. The UBI nginx image loads extra config from `/opt/app-root/etc/nginx.default.d/*.conf`, so the proxy rule is mounted there from a ConfigMap. The **Ingress** is standard Kubernetes; OpenShift turns it into a Route.
 
-⚠️ **Edit the host first:** `deploy/nginx/ingress.yaml` → `host: bookstore-<your-namespace>.apps.<your-cluster-domain>` (find your domain in the console URL).
+The Ingress is **cluster-specific**, so it lives in the overlay, not the base.
+
+⚠️ **Edit the host first:** `deploy/overlays/openshift/ingress.yaml` → `host: bookstore-<your-namespace>.apps.<your-cluster-domain>` (find your domain in the console URL).
 ```bash
-kubectl apply -k deploy/nginx/
+kubectl apply -k deploy/base/nginx/                 # nginx Deployment, Service, ConfigMaps
+kubectl apply -k deploy/overlays/openshift/         # adds the Ingress (everything else is unchanged)
 kubectl get ingress bookstore
 oc get route                                # auto-created route, TERMINATION: edge
 ```
@@ -219,7 +249,7 @@ Open `https://bookstore-<namespace>.apps.<cluster-domain>`. You should see the B
 ### Step 7: Backups (PVC + CronJob)
 **Concept:** a **CronJob** creates a Job on a schedule (`0 2 * * *` = 02:00 **UTC**). It runs `pg_dump` (same major version as the server) into a **separate PVC**.
 ```bash
-kubectl apply -k deploy/backup/
+kubectl apply -k deploy/base/backup/
 kubectl get cronjob pg-backup
 ```
 Test it right away (see [§9.2](#92-backups-and-restore)).
@@ -227,8 +257,8 @@ Test it right away (see [§9.2](#92-backups-and-restore)).
 ### Step 8: Network policies
 **Concept:** NetworkPolicies are a firewall for pods, based on labels. **Allows add up; there's no "deny" rule.** `default-deny-ingress` selects all pods and allows nothing, and the `allow-*` policies open only what's needed.
 ```bash
-kubectl apply -k deploy/policies/ --dry-run=server
-kubectl apply -k deploy/policies/
+kubectl apply -k deploy/base/policies/ --dry-run=server
+kubectl apply -k deploy/base/policies/
 ```
 In the **sandbox**, you must also remove `allow-same-namespace`, or nothing is restricted. Follow [§9.4](#94-network-policies) (save a backup first, **after** applying our policies).
 
@@ -236,25 +266,22 @@ In the **sandbox**, you must also remove `allow-same-namespace`, or nothing is r
 
 ## 7. Daily start-up (after the sandbox idles)
 
-The sandbox scales workloads to 0 after ~12h. Data (PVCs) is safe. Re-applying your files restores the replica counts, **in order**:
+The sandbox scales workloads to 0 after ~12h. Data (PVCs) is safe. Re-applying the overlay restores everything:
 ```bash
 cd k8s-bookstore-lab
 kubectl get deploy,sts,pods,pvc                           # what's there?
-kubectl get secret postgres-credentials mongo-credentials # should still exist
+kubectl diff -k deploy/overlays/openshift                 # what would change?
 
-kubectl apply -k deploy/postgres/
-kubectl apply -k deploy/mongo/
-kubectl get pods -l 'app in (postgres,mongo)' -w          # wait for 1/1 on both
+kubectl apply -k deploy/overlays/openshift                # everything except the migration Job
+kubectl get pods -l 'app in (postgres,mongo)' -w          # wait for 1/1 on both DBs
 
 kubectl delete job db-migrate --ignore-not-found          # a Job can't be re-applied
-kubectl apply -k deploy/migrate/
+kubectl apply -k deploy/base/migrate/
 kubectl logs -f job/db-migrate                            # expect "skip" lines
 
-kubectl apply -k deploy/api/
-kubectl apply -k deploy/nginx/
 kubectl get pods                                          # everything 1/1
 ```
-**Why this order?** If the API starts before the DBs, `/api/readyz` fails and its pods stay `0/1` (not ready, but not broken). They become ready on their own once the DBs are up.
+**Why is it OK to start everything at once?** If the API starts before the DBs, `/api/readyz` fails and its pods stay `0/1` (not ready, but not broken). They become ready on their own once the DBs are up. The **migration Job** is the exception: run it after the DBs are ready. (Later, Argo CD sync waves/hooks will handle this ordering automatically.)
 
 ---
 
@@ -285,11 +312,11 @@ for i in 1 2 3 4 5 6; do curl -s $URL/api/info; echo; done   # pod name varies
 ### 9.1 Migrations
 ```bash
 kubectl delete job db-migrate
-kubectl apply -k deploy/migrate/
+kubectl apply -k deploy/base/migrate/
 kubectl logs job/db-migrate          # already-applied files print "skip"
 kubectl exec postgres-0 -- psql -d bookstore -c 'SELECT * FROM schema_migrations;'
 ```
-- To add a migration: create `app/api/migrations/003_<name>.sql` → push (CI builds a new image) → update the image tag in `deploy/migrate/job.yaml` and `deploy/api/deployment.yaml` → run the Job.
+- To add a migration: create `app/api/migrations/003_<name>.sql` → push (CI builds a new image) → update the image tag in `deploy/base/migrate/job.yaml` and `deploy/base/api/deployment.yaml` → run the Job.
 - Each file runs in **one transaction**: a failure rolls back the whole file and isn't recorded, so it's retried next time.
 
 ### 9.2 Backups and restore
@@ -306,9 +333,9 @@ Backups older than 7 days are deleted automatically by the CronJob script.
 # 1. (drill only) simulate an accident
 kubectl exec postgres-0 -- psql -d bookstore -c 'DROP TABLE books;'
 
-# 2. set BACKUP_FILE in deploy/backup/restore-job.yaml to the file from the backup logs
+# 2. set BACKUP_FILE in deploy/base/backup/restore-job.yaml to the file from the backup logs
 # 3. run the restore: applied with -f because it's NOT part of the kustomization
-kubectl apply -f deploy/backup/restore-job.yaml
+kubectl apply -f deploy/base/backup/restore-job.yaml
 kubectl logs -f job/pg-restore       # "restore complete"
 kubectl exec postgres-0 -- psql -d bookstore -c 'SELECT id, title FROM books;'
 
@@ -363,7 +390,7 @@ kubectl apply -f ~/k8s-bookstore-lab-backups/allow-same-namespace.backup.yaml
 
 **Remove our policies** (everything back to open):
 ```bash
-kubectl delete -k deploy/policies/
+kubectl delete -k deploy/base/policies/
 ```
 
 **Allowed traffic**
@@ -402,7 +429,12 @@ oc image info ghcr.io/jyotirbhandari/bookstore-api:sha-<commit> --filter-by-os=l
 - Check that a base image supports your architectures **before** adding them to `platforms` (e.g. `oc image info registry.access.redhat.com/ubi9/nodejs-24` lists `linux/arm64/v8`).
 - The package is public because it's linked to the public repo (inherited access).
 
-**Deploying a new version:** update the `image:` tag in `deploy/api/deployment.yaml` (and `deploy/migrate/job.yaml`) → `kubectl apply -k`. (Argo CD will automate this later.)
+**Deploying a new version:**
+- **OpenShift:** the tag is still set in `deploy/base/api/deployment.yaml` and `deploy/base/migrate/job.yaml`. Update both → `kubectl apply -k deploy/overlays/openshift`.
+- **Local:** the tag is set once in `deploy/overlays/local/kustomization.yaml` → `images:` → `newTag`.
+- (Argo CD will automate this later.)
+
+> ⚠️ **Known gap:** `migrate/` isn't part of the base kustomization, so an overlay's `images:` and `namespace:` don't reach the migration Job. It's handled when we run it locally (Stage 1).
 
 > ℹ️ First multi-arch image: `sha-b41a021`. The sandbox YAML still uses `sha-4b616d7` (amd64-only), which works there because sandbox nodes are amd64.
 
@@ -447,7 +479,7 @@ Real problems we hit while building this, and how we found them.
 | ConfigMap / Secret | Config / credentials outside the image | nginx files / DB passwords |
 | PVC / StorageClass | Persistent disk request / how disks are created | `data-postgres-0`, `pg-backups` / `gp3` |
 | HPA | Scale replicas on metrics | `api` 2–5 |
-| NetworkPolicy | Pod firewall (L3/L4, label-based, additive) | `deploy/policies/` |
+| NetworkPolicy | Pod firewall (L3/L4, label-based, additive) | `deploy/base/policies/` |
 | ResourceQuota / LimitRange | Namespace budget / per-pod defaults | Set by the sandbox |
 | requests vs limits | Guaranteed (scheduling, quota, HPA %) vs maximum (CPU throttled, memory OOMKilled) | All pods |
 | QoS class | Guaranteed (req = lim) > Burstable > BestEffort (evicted first) | `api` = Burstable |
@@ -485,7 +517,7 @@ Real problems we hit while building this, and how we found them.
 
 **Before going local**
 - [x] Multi-arch image (`linux/amd64` + `linux/arm64`), first tag `sha-b41a021`
-- [ ] Kustomize `base/` + `overlays/{openshift,local}`
+- [x] Kustomize `base/` + `overlays/{openshift,local}` (verified with `kubectl diff`: exit 0)
 - [ ] Secrets out of `kustomization.yaml`
 
 **Local cluster (Colima + kind)**
@@ -500,13 +532,8 @@ Real problems we hit while building this, and how we found them.
 ## 15. Teardown
 
 ```bash
-kubectl delete -k deploy/policies/
-kubectl delete -k deploy/backup/
-kubectl delete -k deploy/nginx/
-kubectl delete -k deploy/api/
-kubectl delete -k deploy/migrate/
-kubectl delete -k deploy/mongo/
-kubectl delete -k deploy/postgres/
+kubectl delete -k deploy/base/migrate/ --ignore-not-found   # the Job isn't part of the overlay
+kubectl delete -k deploy/overlays/openshift                 # everything else (incl. the Ingress)
 
 # StatefulSet PVCs are NOT deleted automatically (on purpose: data safety).
 kubectl get pvc
